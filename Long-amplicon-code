@@ -1,0 +1,249 @@
+
+# set paths in HPC
+export PROJAPPL=/projappl/jugalarz
+export TMPDIR=/scratch/project/tmp
+
+# after updating to ccs v6. it was necessary to export the tmp. ccs tries to write 
+# to tmp which can be very small
+
+# For PacBio sequel II 96 barcodes full-length 16S amplicon 275Gb subreads.bam (98,335,851 reads) using all
+# 40 cores css v6. takes 2-01:16:44 runtime. 
+
+source activate PacBioConda # this needs to be created (https://research.csc.fi/-/bioconda)
+#export PATH=$PATH:/projappl/jugalarz/SeqKit/
+#export PATH=$PATH:/projappl/jugalarz/CSVTK/ 
+
+
+#Extract single file from .tar file
+#tar -xvf Poo_Transplant_PacBio.tar result_X204SC20080763-Z01-F001/1_A05/m54217_200819_021238.subreads.bam
+
+ccs --top-passes 10 --min-length 1000 --max-length 1800 m64285e_211016_095735.subreads.bam ccs_m64285e_211016_095735.bam 
+#--num-threads 8 --log-level FATAL --log-file erros_csc.txt
+
+lima --peek-guess --different --ccs --min-length 1440 --max-input-length 1700 \
+--min-end-score 26 --split-bam-named --num-threads 2 \
+ccs_m64285e_211016_095735.bam PacBio_Barcodes.fa Wild_nf_2021_per_Bc.fastq
+
+conda deactivate
+
+#### Start R ####
+
+library(dada2)
+library(Biostrings)
+library(ggplot2)
+library(phyloseq)
+library(RColorBrewer);packageVersion("RColorBrewer")
+library(readxl)
+
+path2 <- "/Users/jugalarz/Desktop/temp/" # CHANGE ME to location of the fastq files
+path.out <- "Figures/" 
+path.rds <- "RDS/" 
+fns2 <- list.files(path2, pattern="fastq", full.names=TRUE)
+F27 <- "AGAGTTTGATCMTGGCTCAG"
+R1492 <- "CCTTGTTACGACTTCACCCCAG"
+rc <- dada2:::rc
+theme_set(theme_bw())
+
+# Remove primers
+nops2 <- file.path(path2, "noprimers", basename(fns2))
+
+prim2 <- removePrimers(fns2, nops2, primer.fwd=F27, primer.rev=dada2:::rc(R1492),
+                       orient=TRUE, allow.indels=TRUE, verbose = TRUE, max.mismatch = 4, compress = FALSE)
+#Inspect lenght distribution
+lens.fn <- lapply(nops2, function(fn) nchar(getSequences(fn)))
+lens <- do.call(c, lens.fn)
+hist(lens, 100)
+
+#Filter
+filts2 <- file.path(path2, "noprimers", "filtered", basename(fns2))
+track2
+track2 <- filterAndTrim(nops2, filts2, minQ=2, minLen=1300, maxLen=1600, maxN=0,
+                        rm.phix=FALSE, maxEE=5, compress = FALSE)
+#Dereplicate
+drp2 <- derepFastq(filts2, verbose=TRUE)
+
+#Learn errors
+err2 <- learnErrors(drp2, errorEstimationFunction=PacBioErrfun, BAND_SIZE=32, multithread=TRUE)
+plotErrors(err2)
+
+#saveRDS(err2, file.path(path.rds, "Wild_NF.rds"))# This gives me an error. Something wrong with the path
+
+#Infer ASVs
+dd2 <- dada(drp2, err=err2, BAND_SIZE=32, multithread=TRUE)
+dd2
+cbind(ccs=prim2[,1], primers=prim2[,2], filtered=track2[,2], denoised=sapply(dd2, function(x) sum(x$denoised)))
+
+#Make sequence table
+st2 <- makeSequenceTable(dd2); dim(st2)
+
+#Assigning taxonomy
+tax2 <- assignTaxonomy(st2, "/Users/jugalarz/Downloads/silva_nr99_v138_wSpecies_train_set.fa", multithread=TRUE)
+#reformat Escherichia
+tax2[,"Genus"] <- gsub("Escherichia/Shigella", "Escherichia", tax2[,"Genus"]) 
+
+#check for Chimeras
+bim2 <- removeBimeraDenovo(st2, minFoldParentOverAbundance=5, multithread=TRUE)
+bim2 <- isBimeraDenovo(st2, minFoldParentOverAbundance=5 , multithread=TRUE)
+table(bim2)
+# Check fraction of chimeric sequences
+sum(st2[,bim2])/sum(st2)
+
+
+#Change the colum names (sequences at this point in st2) to ASV_1...ASV_n
+asv_seqs <- colnames(st2) #Get the column names
+asv_headers <- vector(dim(st2)[2], mode="character") #create a character vector of same dimensions
+
+#Replace the sequence with ASV_1...ASV_n
+for (i in 1:dim(st2)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+#Get the sequences and export it as ASVs.fa
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, file = "/Users/jugalarz/Desktop/Poo_16S_DADA_temp/Poo_ASV.fasta") #Save it to file
+
+#Create a count (OTU/ASV) table
+asv_tab <- t(st2) #Transpose st2 and delete ">" from the rownames
+row.names(asv_tab) <- sub(">", "", asv_headers)
+colnames(asv_tab) <- sub(".fastq", "", colnames(asv_tab)) # Remove the .fastq extension
+#save it to a file
+write.table(asv_tab, file = "/Users/jugalarz/Desktop/Poo_16S_DADA_temp/Poo_ASV.tsv", sep="\t", quote=F, col.names=NA)
+
+#Do the same with the taxonomy table
+asv_tax <- tax2
+row.names(asv_tax) <- sub(">", "", asv_headers)
+write.table(asv_tax, "/Users/jugalarz/Desktop/Poo_16S_DADA_temp/Poo_ASV_tax.tsv", sep="\t", quote=F, col.names=NA)
+
+######-------------Phyloseq
+
+sampledatdf <- read_excel("/Users/Omistaja/Downloads/NF_Wild_R/otus_NF_wild.xlsx", 
+                          sheet = "sample_data")
+
+sampledatdf <- as.data.frame(sampledatdf)
+row.names(sampledatdf) <- sampledatdf$Sample
+sampledata = sample_data(sampledatdf)
+ps2 <- phyloseq(otu_table(asv_tab, taxa_are_rows=TRUE), tax_table(asv_tax), sample_data(sampledata))
+ps3 <- phyloseq(otu_table(asv_tab, taxa_are_rows = TRUE, asv_tab[asv_tab<10]<-0), tax_table(phyrepT_omit), sample_data(sampledata))
+plot_heatmap(ps2)
+plot_bar(ps3, x='Location', fill="Genus")
+plot_bar(phyrepT, x='Latitude', fill='Genus')
+ps5@sam_data$Location <- factor(ps5@sam_data$Location, levels=c("EST", "SFI", "CFI", "NFI"))
+plot_bar(ps5, x = 'Colour', fill = 'Family', title = 'Abundance of ASVs in colour morphs')
+
+# rarefecation
+phyrepT<-rarefy_even_depth(ps2, sample.size = 815, rngseed = TRUE, replace = TRUE)
+sample_sums(ps2)
+sample_sums(ps5)
+sample_sums(ps3)
+sample_sums(ps4)
+
+f<-transform(finland, 'compositional')
+e<-transform(estonia, 'compositional')
+core.taxa.standard <- core_members(e, detection = 0, prevalence = 50/100)
+core.taxa.standard
+
+plot_bar(finland, x = 'Location', fill = 'Genus')
+plot_bar(estonia, fill = 'Genus')
+plot_bar(phyrepT, x = 'Latitude', fill = 'Genus')
+grid.arrange(z, x, y, w)
+z<-plot_bar(est.pruned, fill = 'Family')
+y<-plot_bar(cfi.pruned, fill = 'Family')
+x<-plot_bar(tva.pruned, fill = 'Family')
+w<-plot_bar(nfi.pruned, fill = 'Family')
+plot_bar(ps5, fill = 'Genus')
+
+plot_richness(ps5, measures = c('Chao1','Shannon'), x='Colour', title = "Alpha diversity of colour morphs")
+
+plot_richness(finland, measures = c("Chao1","Shannon"), x="Location")
+plot_richness(nfi.pruned, measures = c('Chao1', 'Shannon'))
+
+library(microbiome)
+p<-plot_core(transform(finland, 'compositional'), prevalences=seq(0.1,1,0.1), detections=seq(0.01,1, length=10), plot.type = 'heatmap')
+
+
+dist_methods <- unlist(distanceMethodList)
+print(dist_methods)
+# These require tree
+dist_methods[(1:3)]
+# Remove them from the vector
+dist_methods <- dist_methods[-(1:3)]
+# This is the user-defined method:
+dist_methods["designdist"]
+# Remove the user-defined distance
+dist_methods = dist_methods[-which(dist_methods=="ANY")]
+plist <- vector("list", length(dist_methods))
+names(plist) = dist_methods
+for( i in dist_methods ){
+  # Calculate distance matrix
+  iDist <- distance(ps5, method=i)
+  # Calculate ordination
+  iMDS  <- ordinate(ps5, "MDS", distance=iDist)
+  ## Make plot
+  # Don't carry over previous plot (if error, p will be blank)
+  p <- NULL
+  # Create plot, store as temp variable, p
+  p <- plot_ordination(ps5, iMDS, color="Latitude", shape="Location")
+  # Add title to each plot
+  p <- p + ggtitle(paste("MDS using distance method ", i, sep=""))
+  # Save the graphic to file.
+  plist[[i]] = p
+}
+df = ldply(plist, function(x) x$data)
+names(df)[1] <- "distance"
+p = ggplot(df, aes(Axis.1, Axis.2, color="Latitude", shape=Location))
+p = p + geom_point(size=2, alpha=0.5)
+p = p + facet_wrap(~distance, scales="free")
+p = p + ggtitle("MDS on various distance metrics for WTM microbiome")
+p
+print(plist[["chao"]])
+
+l = ggplot()
+############## statistical analysis ###############
+############ linear model ###########
+library(limma)
+library(knitr)
+otu <- abundances(microbiome::transform(ps5, "log10"))
+meta <- meta(ps5)
+tab <- lm_phyloseq(ps5, "Latitude")
+kable(head(tab), digits = 3) #shows which asv are significantly different 
+#between the different locations
+
+design <- cbind(intercept = 1, Grp2vs1 = meta[["Location"]])
+rownames(design) <- rownames(meta)
+design <- design[colnames(otu), ]
+
+# NOTE: results and p-values are given for all groupings in the design matrix
+# Now focus on the second grouping ie. pairwise comparison
+coef.index <- 2
+
+# Fit the limma model
+fit <- lmFit(otu, design)  ###problem here with the matrix....
+fit <- eBayes(fit)
+
+# Limma P-values
+pvalues.limma = fit$p.value[, 2]
+pvalues.limma
+# Limma effect sizes
+efs.limma <-  fit$coefficients[, "Grp2vs1"]
+efs.limma
+# Summarise
+library(knitr)
+kable(topTable(fit, coef = efs.limma, p.value=pvalues.limma), digits = 2)
+
+#### permanova########
+pseq.rel <- microbiome::transform(ps5, "compositional")
+otu <- abundances(pseq.rel)
+meta <- meta(pseq.rel)
+
+library(vegan)
+permanova <- adonis(t(otu) ~ Location,
+                    data = meta, permutations=99, method = "bray")
+
+# P-value
+print(as.data.frame(permanova$aov.tab)["Location", "Pr(>F)"])
+#check homogeneity
+dist <- vegdist(t(otu))
+v <- anova(betadisper(dist, meta$Location))
+summary(v)
+print(v)
+hist(dist, main = "Index of Ecological distance", xlab = 'Distance', ylab = 'Frequency')
